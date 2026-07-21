@@ -43,10 +43,20 @@ Base URLs: Singapore `tokenhub-intl.tencentcloudmaas.com` (default), Guangzhou `
 
 The proxy itself is gated by a shared secret, `PROXY_API_KEY` — separate from
 `TOKENHUB_API_KEY`, which never leaves the server. Every `/v1/*` and
-`/plan/*` request must present it as `Authorization: Bearer <PROXY_API_KEY>`
-or `x-api-key: <PROXY_API_KEY>`; requests without a matching key get a `401`
-before anything is forwarded upstream. A missing `PROXY_API_KEY` on the
-server fails closed (`500`) rather than silently allowing all traffic.
+`/plan/*` request must present it one of three ways: `Authorization: Bearer
+<PROXY_API_KEY>`, `x-api-key: <PROXY_API_KEY>`, or `?api_key=<PROXY_API_KEY>`
+in the URL; requests without a matching key get a `401` before anything is
+forwarded upstream. If more than one is sent, a header wins over the query
+param. A missing `PROXY_API_KEY` on the server fails closed (`500`) rather
+than silently allowing all traffic.
+
+The query-string form exists for contexts that can't set custom headers —
+e.g. a browser `EventSource` consuming an SSE stream directly, or a quick
+link for manual testing. Prefer a header when you control the client: query
+strings are more likely to end up in server access logs or shell history.
+`?api_key=` is always stripped before the request reaches TokenHub, so it
+never leaks upstream, but every other query param (e.g. `GET /v1/batches`
+pagination) still passes through untouched.
 
 This is the header the client-facing SDK's `apiKey` field carries — set it to
 `PROXY_API_KEY`, not your TokenHub key:

@@ -54,6 +54,12 @@ curl -s "$BASE_URL/v1/models" \
   -H "Authorization: Bearer $PROXY_API_KEY"
 echo -e "\n"
 
+echo "=== List models, authenticated via ?api_key= instead of a header ==="
+echo "    (for clients that can't set custom headers, e.g. a browser EventSource)"
+curl -s -G "$BASE_URL/v1/models" \
+  --data-urlencode "api_key=$PROXY_API_KEY"
+echo -e "\n"
+
 echo "=== Missing/wrong proxy key -> 401 from the proxy itself (never reaches TokenHub) ==="
 curl -s -w '\n[status=%{http_code}]\n' "$BASE_URL/v1/models" \
   -H "Authorization: Bearer wrong-key"

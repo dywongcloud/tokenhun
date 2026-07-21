@@ -1,10 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
+import { PROXY_API_KEY_QUERY_PARAM } from "@/lib/tokenhub";
 
 // Guards every mapped TokenHub route with a proxy-level shared secret, so
 // only callers who know PROXY_API_KEY can spend your TokenHub quota. This is
 // checked BEFORE the request reaches lib/tokenhub.ts, which strips whatever
-// Authorization/x-api-key header the client sent and substitutes the real
-// upstream key — so the proxy key and the TokenHub key never mix.
+// Authorization/x-api-key header (or ?api_key= query param) the client sent
+// and substitutes the real upstream key — so the proxy key and the TokenHub
+// key never mix, and the proxy key never reaches TokenHub either way.
 export const config = {
   matcher: ["/v1/:path*", "/plan/:path*"],
 };
@@ -20,6 +22,9 @@ function timingSafeEqual(a: string, b: string): boolean {
   return diff === 0;
 }
 
+// Headers take precedence over the query param when more than one is
+// present; most callers send exactly one, so this only matters for a
+// caller mixing both, in which case the header is treated as authoritative.
 function extractPresentedKey(req: NextRequest): string | null {
   const auth = req.headers.get("authorization");
   const bearerMatch = auth ? /^Bearer\s+(.+)$/i.exec(auth.trim()) : null;
@@ -27,6 +32,9 @@ function extractPresentedKey(req: NextRequest): string | null {
 
   const xApiKey = req.headers.get("x-api-key");
   if (xApiKey) return xApiKey;
+
+  const queryKey = req.nextUrl.searchParams.get(PROXY_API_KEY_QUERY_PARAM);
+  if (queryKey) return queryKey;
 
   return null;
 }
@@ -57,7 +65,7 @@ export function middleware(req: NextRequest) {
       {
         error: {
           message:
-            "Invalid or missing proxy API key. Send it as 'Authorization: Bearer <key>' or 'x-api-key: <key>'.",
+            "Invalid or missing proxy API key. Send it as 'Authorization: Bearer <key>', 'x-api-key: <key>', or '?api_key=<key>'.",
           type: "proxy_auth_error",
           code: presented ? "invalid_proxy_api_key" : "missing_proxy_api_key",
         },

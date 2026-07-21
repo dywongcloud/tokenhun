@@ -2,6 +2,10 @@ import { NextRequest } from "next/server";
 
 const DEFAULT_BASE_URL = "https://tokenhub-intl.tencentcloudmaas.com";
 
+// Shared with middleware.ts: the query param name it accepts as an
+// alternative to Authorization/x-api-key headers for the proxy's own key.
+export const PROXY_API_KEY_QUERY_PARAM = "api_key";
+
 /** Hop-by-hop / connection-managed headers that must not be forwarded either direction. */
 const STRIP_REQUEST_HEADERS = new Set([
   "host",
@@ -45,8 +49,10 @@ export interface ProxyOptions {
 
 /**
  * Forward a request 1:1 to the TokenHub API and stream the response back.
- * The upstream path is mapped verbatim; query string, method, body, and
- * SSE streams pass through untouched. The API key never leaves the server.
+ * The upstream path is mapped verbatim; method, body, and SSE streams pass
+ * through untouched, and so does the query string except for a stripped
+ * ?api_key= (the proxy's own credential, never the caller's). The TokenHub
+ * API key never leaves the server.
  */
 export async function proxyToTokenHub(
   req: NextRequest,
@@ -73,6 +79,13 @@ export async function proxyToTokenHub(
   const baseUrl = (process.env.TOKENHUB_BASE_URL ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
   const url = new URL(baseUrl + upstreamPath);
   url.search = req.nextUrl.search;
+  // The proxy's own key may have been presented as ?api_key=... (see
+  // middleware.ts); it must never reach TokenHub, so it never enters the
+  // 1:1-forwarded query string. Left untouched when absent, so every other
+  // query param (e.g. GET /v1/batches pagination) still passes through raw.
+  if (url.searchParams.has(PROXY_API_KEY_QUERY_PARAM)) {
+    url.searchParams.delete(PROXY_API_KEY_QUERY_PARAM);
+  }
 
   const headers = new Headers();
   req.headers.forEach((value, key) => {
