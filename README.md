@@ -16,9 +16,40 @@ A Next.js API proxy for [Tencent Cloud TokenHub](https://www.tencentcloud.com/do
 | GET/POST | `/v1/batches` | OpenAI-compatible | Batch list/create |
 | GET/POST | `/v1/batches/{...}` | OpenAI-compatible | Batch retrieve/cancel — sub-paths forwarded verbatim |
 | POST | `/plan/anthropic/v1/messages` | Anthropic-compatible | TokenPlan surface — needs `TOKENHUB_PLAN_API_KEY` (subscription-plan key) |
-| GET | `/` | — | Service descriptor listing all mapped endpoints |
+| GET | `/` | — | Interactive terminal console (see below) |
+| GET | `/api/endpoints` | — | Machine-readable service descriptor (formerly served at `GET /`) |
 
 Endpoints that do **not** exist upstream (verified by live probe) and are therefore not mapped: `/v1/files`, `/v1/completions`, `/v1/rerank`, `/v1/messages/count_tokens`.
+
+## Interactive console
+
+`GET /` serves an xterm.js-based terminal console for exercising every endpoint above without leaving the browser — a REPL with a command per endpoint, each pre-filled with a working example body you can run as-is or override.
+
+```
+tokenhub ❯ auth set
+Proxy API key (hidden): ••••••••••••••••••
+Proxy key set (ending "…yday"). Stored in this browser only.
+
+tokenhub ❯ chat "Say hello"
+POST /v1/chat/completions
+✓ 200 OK
+{
+  "id": "…",
+  "choices": [ { "message": { "content": "Hello!" } } ],
+  …
+}
+
+tokenhub ❯ chat.stream "Count to 3"
+POST /v1/chat/completions (stream)
+✓ 200 streaming…
+1, 2, 3
+```
+
+- **Auth**: `auth set` prompts for `PROXY_API_KEY` without echoing it to the screen or recording it in command history; `auth <key>` sets it inline (faster, but visible in the terminal transcript, same tradeoff as passing a secret as a CLI argument anywhere); `auth clear` / bare `auth` clear or check status. The key is stored in `localStorage`, scoped to your browser, and never sent anywhere except as this same proxy's own `Authorization` header — it is not logged or persisted server-side.
+- **Commands**: one per endpoint (`chat`, `chat.stream`, `messages`, `messages.stream`, `embeddings`, `embeddings.multimodal`, `translate`, `models`, `batches.list`, `batches.create`, `batches.get`, `plan.messages`), plus `endpoints`, `help`, `clear`, and `copy`. Every command accepts `--raw '<json>'` to fully replace its preset body. Run `help` for the full list, `help <command>` for usage.
+- **Syntax highlighting**: JSON responses are colorized (keys/strings/numbers/booleans distinguished; long primitive arrays — e.g. embedding vectors — are truncated with a count so a 1024-float response doesn't flood the screen); the input line is colorized live as you type (command name, quoted strings, `--flags`).
+- **Copy/paste**: drag-select text and press Ctrl/Cmd+C to copy it to the OS clipboard (does not also trigger cancel — that only fires on Ctrl+C with no active selection); the `copy` command copies the last response body directly. Ctrl/Cmd+V pastes from the OS clipboard into the input line, same as any native terminal.
+- Every response is escaped before being written to the terminal (JSON string leaves via `JSON.stringify`'s own escaping, raw streamed text via an explicit sanitizer) so a model response containing a raw control byte can't be interpreted as a live terminal escape sequence.
 
 ## Setup
 
