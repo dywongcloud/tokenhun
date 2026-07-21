@@ -34,17 +34,26 @@ npm run dev                  # or: npm run build && npm start
 TOKENHUB_API_KEY=sk-...                                      # required
 TOKENHUB_BASE_URL=https://tokenhub-intl.tencentcloudmaas.com # optional (default)
 TOKENHUB_PLAN_API_KEY=sk-...                                 # optional, TokenPlan only
+PROXY_API_KEY=...                                            # required — see Auth below
 ```
 
 Base URLs: Singapore `tokenhub-intl.tencentcloudmaas.com` (default), Guangzhou `tokenhub.tencentcloudmaas.com`; `.tech` variants of both exist as backup domains.
 
-## Usage
+## Auth
 
-Point any OpenAI SDK at the proxy:
+The proxy itself is gated by a shared secret, `PROXY_API_KEY` — separate from
+`TOKENHUB_API_KEY`, which never leaves the server. Every `/v1/*` and
+`/plan/*` request must present it as `Authorization: Bearer <PROXY_API_KEY>`
+or `x-api-key: <PROXY_API_KEY>`; requests without a matching key get a `401`
+before anything is forwarded upstream. A missing `PROXY_API_KEY` on the
+server fails closed (`500`) rather than silently allowing all traffic.
+
+This is the header the client-facing SDK's `apiKey` field carries — set it to
+`PROXY_API_KEY`, not your TokenHub key:
 
 ```ts
 import OpenAI from "openai";
-const client = new OpenAI({ baseURL: "http://localhost:3000/v1", apiKey: "unused" });
+const client = new OpenAI({ baseURL: "http://localhost:3000/v1", apiKey: process.env.PROXY_API_KEY });
 const res = await client.chat.completions.create({
   model: "deepseek-v4-flash",
   messages: [{ role: "user", content: "hello" }],
@@ -56,10 +65,15 @@ Or an Anthropic SDK (base URL **without** `/v1` — the SDK appends `/v1/message
 
 ```ts
 import Anthropic from "@anthropic-ai/sdk";
-const client = new Anthropic({ baseURL: "http://localhost:3000", apiKey: "unused" });
+const client = new Anthropic({ baseURL: "http://localhost:3000", apiKey: process.env.PROXY_API_KEY });
 ```
 
-The `apiKey` you pass to the SDK is ignored — the proxy strips inbound `Authorization`/`x-api-key` headers and injects the server-side key.
+The middleware reads whichever header the SDK sends (`Authorization: Bearer`
+for OpenAI, `x-api-key` for Anthropic) and validates it against
+`PROXY_API_KEY` with a constant-time comparison; `lib/tokenhub.ts` then
+strips that header and substitutes the real TokenHub key before forwarding,
+so the proxy key and the TokenHub key never mix and the client-supplied key
+never reaches Tencent.
 
 ## Behavior
 
@@ -76,4 +90,4 @@ LLMs: `hy3`, `deepseek-v4-flash`, `deepseek-v4-pro`, `deepseek-v4-flash-202605`,
 ## Deployment notes
 
 - Long streaming responses need a runtime without short function timeouts (self-hosted `next start`, or set an adequate `maxDuration` on your platform).
-- This proxy adds no authentication of its own — anyone who can reach it can spend your TokenHub quota. Put it behind your own auth/network controls before exposing it.
+- `PROXY_API_KEY` gates every mapped endpoint (see Auth above); rotate it the same way you'd rotate any shared secret, and still put the proxy behind your own network controls if it's internet-facing — a single static shared key is not a substitute for per-client credentials or rate limiting.
