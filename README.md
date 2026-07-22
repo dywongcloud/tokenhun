@@ -132,3 +132,21 @@ LLMs: `hy3`, `deepseek-v4-flash`, `deepseek-v4-pro`, `deepseek-v4-flash-202605`,
 
 - Long streaming responses need a runtime without short function timeouts (self-hosted `next start`, or set an adequate `maxDuration` on your platform).
 - `PROXY_API_KEY` gates every mapped endpoint (see Auth above); rotate it the same way you'd rotate any shared secret, and still put the proxy behind your own network controls if it's internet-facing — a single static shared key is not a substitute for per-client credentials or rate limiting.
+
+### Vercel
+
+`vercel.json` sets `functions.maxDuration: 1800` (30 minutes) for every `/v1/*` and `/plan/*` route, and each of those route files also exports `maxDuration = 1800` directly — the export is what actually takes effect for Next.js App Router on Vercel (confirmed by inspecting `.next/server/functions-config-manifest.json` after a build); `vercel.json`'s `functions` entry is included because it's the documented mechanism for the field, but Vercel's own docs route Next.js ≥13.5 App Router through the per-file export instead.
+
+**1800s is the actual maximum, not 3600s.** A true 1-hour Vercel Function does not exist on any current plan:
+
+| Plan | Default | Maximum |
+|------|---------|---------|
+| Hobby | 300s | 300s (hard cap, no override) |
+| Pro / Enterprise | 300s | 800s GA, **1800s extended (beta)** |
+
+Reaching the 1800s value used here requires:
+- **Pro or Enterprise** — Hobby cannot exceed 300s regardless of any config in this repo.
+- The project's **Node.js Version** set to `20.x`, `22.x`, or `24.x` in Vercel's dashboard (**Project Settings → Functions**) — this is the only currently-supported runtime range for the extended-duration beta and isn't something a config file can set for you.
+- Not using Secure Compute or Static IPs, which don't support durations above 800s during the beta.
+
+For workloads that genuinely need more than 30 minutes, Vercel's own guidance is to use [Vercel Workflows](https://vercel.com/docs/workflows) instead of a single long-running function.
