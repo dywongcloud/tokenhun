@@ -31,12 +31,18 @@ const STRIP_RESPONSE_HEADERS = new Set([
   "content-length",
 ]);
 
-// TokenHub's TPM (tokens-per-minute) limit is a rolling 1-minute window, so a
-// burst that trips it typically clears within a couple of seconds — retrying
-// with backoff turns a transient 429 into a slightly slower success instead
-// of a hard error every time usage briefly spikes over the ceiling.
-const MAX_RATE_LIMIT_RETRIES = 2;
+// Transient-failure retry budget, shared across two distinct causes:
+//  - TPM (tokens-per-minute) 429s: a rolling 1-minute window, so a burst that
+//    trips it typically clears within a couple of seconds.
+//  - 502/503/504 and network-level throws (ECONNRESET, socket hang up, DNS
+//    blips): momentary connectivity/capacity hiccups between this server and
+//    TokenHub, unrelated to the request itself.
+// 500 is deliberately excluded: it means TokenHub's application code errored
+// on this specific request, which an identical retry would most likely just
+// reproduce, unlike the connectivity/capacity issues above.
+const MAX_TRANSIENT_RETRIES = 2;
 const BASE_RETRY_DELAY_MS = 1000;
+const RETRYABLE_STATUSES = new Set([429, 502, 503, 504]);
 
 function parseRetryAfterMs(header: string | null): number | null {
   if (!header) return null;
@@ -138,10 +144,11 @@ export async function proxyToTokenHub(
   const hasBody = req.method !== "GET" && req.method !== "HEAD";
   const body = hasBody ? await req.arrayBuffer() : undefined;
 
-  let upstream: Response;
+  let upstream: Response | undefined;
   let retries = 0;
-  try {
-    while (true) {
+  while (true) {
+    let networkError: unknown;
+    try {
       upstream = await fetch(url, {
         method: req.method,
         headers,
@@ -150,35 +157,51 @@ export async function proxyToTokenHub(
         cache: "no-store",
         signal: req.signal,
       });
-      if (upstream.status !== 429 || retries >= MAX_RATE_LIMIT_RETRIES) break;
-      const retryAfterMs = parseRetryAfterMs(upstream.headers.get("retry-after"));
-      const delayMs = retryAfterMs ?? BASE_RETRY_DELAY_MS * 2 ** retries;
-      retries++;
-      await sleep(delayMs, req.signal);
+    } catch (err) {
+      networkError = err;
     }
-  } catch (err) {
-    const cause = err instanceof Error && err.cause ? ` (${String(err.cause)})` : "";
-    return Response.json(
-      {
-        error: {
-          message: `Upstream TokenHub request failed: ${err instanceof Error ? err.message : String(err)}${cause}`,
-          type: "proxy_upstream_error",
-          code: "upstream_unreachable",
-        },
-      },
-      { status: 502 },
-    );
+
+    const retryableStatus = upstream !== undefined && RETRYABLE_STATUSES.has(upstream.status);
+    if ((networkError === undefined && !retryableStatus) || retries >= MAX_TRANSIENT_RETRIES) {
+      if (networkError !== undefined) {
+        const cause = networkError instanceof Error && networkError.cause ? ` (${String(networkError.cause)})` : "";
+        const message = networkError instanceof Error ? networkError.message : String(networkError);
+        const errorHeaders = new Headers();
+        if (retries > 0) errorHeaders.set("x-tokenhub-proxy-retries", String(retries));
+        return Response.json(
+          {
+            error: {
+              message: `Upstream TokenHub request failed: ${message}${cause}`,
+              type: "proxy_upstream_error",
+              code: "upstream_unreachable",
+            },
+          },
+          { status: 502, headers: errorHeaders },
+        );
+      }
+      break;
+    }
+
+    // Either a thrown network error or a retryable status with budget left.
+    const retryAfterMs = upstream ? parseRetryAfterMs(upstream.headers.get("retry-after")) : null;
+    const delayMs = retryAfterMs ?? BASE_RETRY_DELAY_MS * 2 ** retries;
+    retries++;
+    await sleep(delayMs, req.signal);
   }
+  // Every loop exit other than `break` already `return`s, and `break` is only
+  // reached once a fetch has actually resolved (networkError === undefined),
+  // so `upstream` is always assigned here.
+  const resolvedUpstream = upstream!;
 
   const responseHeaders = new Headers();
-  upstream.headers.forEach((value, key) => {
+  resolvedUpstream.headers.forEach((value, key) => {
     if (!STRIP_RESPONSE_HEADERS.has(key.toLowerCase())) responseHeaders.set(key, value);
   });
   if (retries > 0) responseHeaders.set("x-tokenhub-proxy-retries", String(retries));
 
-  return new Response(upstream.body, {
-    status: upstream.status,
-    statusText: upstream.statusText,
+  return new Response(resolvedUpstream.body, {
+    status: resolvedUpstream.status,
+    statusText: resolvedUpstream.statusText,
     headers: responseHeaders,
   });
 }
