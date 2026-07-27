@@ -123,6 +123,7 @@ never reaches Tencent.
 - **Request bodies are buffered** (not streamed) before forwarding — TokenHub responds early on some routes (e.g. auth errors) and a buffered body is replayable; response streaming is unaffected.
 - **Auth mapping**: OpenAI-protocol routes send `Authorization: Bearer <key>`; Anthropic-protocol routes send `x-api-key: <key>` (upstream accepts both). Vendor headers such as `HY-Preserved-Thinking` and `anthropic-version` pass through.
 - **Errors originating in the proxy itself** (missing key, upstream unreachable) use OpenAI error shape with `type: "proxy_configuration_error" | "proxy_upstream_error"` so they are distinguishable from upstream `gateway_error` responses.
+- **TPM (tokens-per-minute) rate-limit retries**: a `429` from TokenHub is retried up to twice with backoff (honoring `Retry-After` if present, else 1s/2s) before the real error is surfaced — TPM is a rolling 1-minute window, so a brief burst over the ceiling often clears within a couple of seconds. A response that needed a retry carries `X-TokenHub-Proxy-Retries: <n>`; a still-429 response after retries is passed through unmodified. Not applied to any other status code. If you're seeing persistent (not transient) TPM errors, check your account's TPM limit/usage in the TokenHub console — trial accounts default to a low ceiling that a "TPM Guarantee Package" or enabling post-paid billing raises.
 
 ## Models (as listed by `GET /v1/models`, 2026-07)
 

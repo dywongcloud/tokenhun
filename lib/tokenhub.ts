@@ -31,6 +31,40 @@ const STRIP_RESPONSE_HEADERS = new Set([
   "content-length",
 ]);
 
+// TokenHub's TPM (tokens-per-minute) limit is a rolling 1-minute window, so a
+// burst that trips it typically clears within a couple of seconds — retrying
+// with backoff turns a transient 429 into a slightly slower success instead
+// of a hard error every time usage briefly spikes over the ceiling.
+const MAX_RATE_LIMIT_RETRIES = 2;
+const BASE_RETRY_DELAY_MS = 1000;
+
+function parseRetryAfterMs(header: string | null): number | null {
+  if (!header) return null;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const dateMs = Date.parse(header);
+  if (!Number.isNaN(dateMs)) return Math.max(0, dateMs - Date.now());
+  return null;
+}
+
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 export interface ProxyOptions {
   /**
    * Auth style expected by the upstream endpoint:
@@ -105,15 +139,23 @@ export async function proxyToTokenHub(
   const body = hasBody ? await req.arrayBuffer() : undefined;
 
   let upstream: Response;
+  let retries = 0;
   try {
-    upstream = await fetch(url, {
-      method: req.method,
-      headers,
-      body,
-      redirect: "manual",
-      cache: "no-store",
-      signal: req.signal,
-    });
+    while (true) {
+      upstream = await fetch(url, {
+        method: req.method,
+        headers,
+        body,
+        redirect: "manual",
+        cache: "no-store",
+        signal: req.signal,
+      });
+      if (upstream.status !== 429 || retries >= MAX_RATE_LIMIT_RETRIES) break;
+      const retryAfterMs = parseRetryAfterMs(upstream.headers.get("retry-after"));
+      const delayMs = retryAfterMs ?? BASE_RETRY_DELAY_MS * 2 ** retries;
+      retries++;
+      await sleep(delayMs, req.signal);
+    }
   } catch (err) {
     const cause = err instanceof Error && err.cause ? ` (${String(err.cause)})` : "";
     return Response.json(
@@ -132,6 +174,7 @@ export async function proxyToTokenHub(
   upstream.headers.forEach((value, key) => {
     if (!STRIP_RESPONSE_HEADERS.has(key.toLowerCase())) responseHeaders.set(key, value);
   });
+  if (retries > 0) responseHeaders.set("x-tokenhub-proxy-retries", String(retries));
 
   return new Response(upstream.body, {
     status: upstream.status,
