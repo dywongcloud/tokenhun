@@ -9,6 +9,7 @@ next-env.d.ts
 .DS_Store
 
 # gm coding-tool internal state (SQLite db, spool, vendored instruction
-# prose) — session-local tooling, not project source; kept out of this
-# public repo deliberately.
+# prose, codesearch embedding cache) — session-local tooling, not project
+# source; kept out of this public repo deliberately.
 .gm/
+.agentplug-kv/
