@@ -129,7 +129,17 @@ function upstreamMessage(parsed: Record<string, unknown>, fallback: string): str
  * {type:"error"} envelope is rewritten into one.
  */
 async function normalizeErrorResponse(upstream: Response, retries: number): Promise<Response> {
-  const text = await upstream.text();
+  let text: string;
+  try {
+    text = await upstream.text();
+  } catch (err) {
+    // The connection dropped mid-read of an already-non-ok response; degrade
+    // to a named error rather than letting the read failure propagate uncaught.
+    const detail = err instanceof Error ? err.message : String(err);
+    const response = anthropicError(upstream.status, `Upstream returned ${upstream.status} but its body could not be read: ${detail}`, "api_error");
+    if (retries > 0) response.headers.set("x-kimi-proxy-retries", String(retries));
+    return response;
+  }
   let message = text;
   try {
     const parsed = JSON.parse(text);
