@@ -13,3 +13,6 @@ next-env.d.ts
 # source; kept out of this public repo deliberately.
 .gm/
 .agentplug-kv/
+.vercel
+.env*
+!.env.example

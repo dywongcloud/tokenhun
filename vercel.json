@@ -6,6 +6,9 @@
     },
     "app/plan/**/*": {
       "maxDuration": 1800
+    },
+    "app/kimi/**/*": {
+      "maxDuration": 1800
     }
   }
 }

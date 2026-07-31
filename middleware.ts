@@ -1,15 +1,56 @@
 import { NextRequest, NextResponse } from "next/server";
-import { PROXY_API_KEY_QUERY_PARAM } from "@/lib/tokenhub";
+import { PROXY_API_KEY_QUERY_PARAM } from "@/lib/upstream";
 
-// Guards every mapped TokenHub route with a proxy-level shared secret, so
-// only callers who know PROXY_API_KEY can spend your TokenHub quota. This is
-// checked BEFORE the request reaches lib/tokenhub.ts, which strips whatever
+// Guards every mapped upstream route with a proxy-level shared secret, so only
+// callers who know it can spend your quota. This is checked BEFORE the request
+// reaches lib/tokenhub.ts or lib/kimi.ts, which strip whatever
 // Authorization/x-api-key header (or ?api_key= query param) the client sent
-// and substitutes the real upstream key — so the proxy key and the TokenHub
-// key never mix, and the proxy key never reaches TokenHub either way.
+// and substitute the real upstream key — so the proxy key and the upstream key
+// never mix, and the proxy key never reaches the upstream either way.
 export const config = {
-  matcher: ["/v1/:path*", "/plan/:path*"],
+  matcher: ["/v1/:path*", "/plan/:path*", "/kimi/:path*"],
 };
+
+interface GuardedSurface {
+  prefix: string;
+  keyEnv: string;
+  /** Which error envelope this surface's clients can parse. */
+  protocol: "openai" | "anthropic";
+}
+
+// Ordered: the first matching prefix wins, so more specific paths come first.
+// Each surface has its own shared secret, so revoking access to one does not
+// revoke the other.
+const GUARDED_SURFACES: GuardedSurface[] = [
+  { prefix: "/kimi/v1/chat/completions", keyEnv: "KIMI_PROXY_API_KEY", protocol: "openai" },
+  { prefix: "/kimi", keyEnv: "KIMI_PROXY_API_KEY", protocol: "anthropic" },
+  { prefix: "/v1", keyEnv: "PROXY_API_KEY", protocol: "openai" },
+  { prefix: "/plan", keyEnv: "PROXY_API_KEY", protocol: "openai" },
+];
+
+function matchSurface(pathname: string): GuardedSurface | null {
+  return (
+    GUARDED_SURFACES.find(
+      (surface) => pathname === surface.prefix || pathname.startsWith(`${surface.prefix}/`),
+    ) ?? null
+  );
+}
+
+interface ErrorShape {
+  status: number;
+  message: string;
+  anthropicType: string;
+  openaiType: string;
+  openaiCode: string;
+}
+
+function errorResponse(surface: GuardedSurface, shape: ErrorShape): NextResponse {
+  const body =
+    surface.protocol === "anthropic"
+      ? { type: "error", error: { type: shape.anthropicType, message: shape.message } }
+      : { error: { message: shape.message, type: shape.openaiType, code: shape.openaiCode } };
+  return NextResponse.json(body, { status: shape.status });
+}
 
 function timingSafeEqual(a: string, b: string): boolean {
   const aBytes = new TextEncoder().encode(a);
@@ -45,33 +86,30 @@ export function middleware(req: NextRequest) {
   // authenticated request is even sent.
   if (req.method === "OPTIONS") return NextResponse.next();
 
-  const expected = process.env.PROXY_API_KEY;
+  const surface = matchSurface(req.nextUrl.pathname);
+  if (!surface) return NextResponse.next();
+
+  const expected = process.env[surface.keyEnv];
   if (!expected) {
-    return NextResponse.json(
-      {
-        error: {
-          message: "PROXY_API_KEY is not configured on the proxy server. Set it in .env.local.",
-          type: "proxy_configuration_error",
-          code: "missing_proxy_api_key",
-        },
-      },
-      { status: 500 },
-    );
+    return errorResponse(surface, {
+      status: 500,
+      message: `${surface.keyEnv} is not configured on the proxy server. Set it in .env.local.`,
+      anthropicType: "api_error",
+      openaiType: "proxy_configuration_error",
+      openaiCode: "missing_proxy_api_key",
+    });
   }
 
   const presented = extractPresentedKey(req);
   if (!presented || !timingSafeEqual(presented, expected)) {
-    return NextResponse.json(
-      {
-        error: {
-          message:
-            "Invalid or missing proxy API key. Send it as 'Authorization: Bearer <key>', 'x-api-key: <key>', or '?api_key=<key>'.",
-          type: "proxy_auth_error",
-          code: presented ? "invalid_proxy_api_key" : "missing_proxy_api_key",
-        },
-      },
-      { status: 401 },
-    );
+    return errorResponse(surface, {
+      status: 401,
+      message:
+        "Invalid or missing proxy API key. Send it as 'Authorization: Bearer <key>', 'x-api-key: <key>', or '?api_key=<key>'.",
+      anthropicType: "authentication_error",
+      openaiType: "proxy_auth_error",
+      openaiCode: presented ? "invalid_proxy_api_key" : "missing_proxy_api_key",
+    });
   }
 
   return NextResponse.next();

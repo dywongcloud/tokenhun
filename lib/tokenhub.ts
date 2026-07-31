@@ -1,75 +1,13 @@
 import { NextRequest } from "next/server";
+import {
+  PROXY_API_KEY_QUERY_PARAM,
+  UpstreamUnreachableError,
+  fetchWithTransientRetry,
+  forwardableRequestHeaders,
+  forwardableResponseHeaders,
+} from "@/lib/upstream";
 
 const DEFAULT_BASE_URL = "https://tokenhub-intl.tencentcloudmaas.com";
-
-// Shared with middleware.ts: the query param name it accepts as an
-// alternative to Authorization/x-api-key headers for the proxy's own key.
-export const PROXY_API_KEY_QUERY_PARAM = "api_key";
-
-/** Hop-by-hop / connection-managed headers that must not be forwarded either direction. */
-const STRIP_REQUEST_HEADERS = new Set([
-  "host",
-  "connection",
-  "keep-alive",
-  "transfer-encoding",
-  "upgrade",
-  "te",
-  "trailer",
-  "proxy-authorization",
-  "proxy-connection",
-  "content-length",
-  "accept-encoding",
-  "authorization",
-  "x-api-key",
-]);
-
-const STRIP_RESPONSE_HEADERS = new Set([
-  "connection",
-  "keep-alive",
-  "transfer-encoding",
-  "content-encoding",
-  "content-length",
-]);
-
-// Transient-failure retry budget, shared across two distinct causes:
-//  - TPM (tokens-per-minute) 429s: a rolling 1-minute window, so a burst that
-//    trips it typically clears within a couple of seconds.
-//  - 502/503/504 and network-level throws (ECONNRESET, socket hang up, DNS
-//    blips): momentary connectivity/capacity hiccups between this server and
-//    TokenHub, unrelated to the request itself.
-// 500 is deliberately excluded: it means TokenHub's application code errored
-// on this specific request, which an identical retry would most likely just
-// reproduce, unlike the connectivity/capacity issues above.
-const MAX_TRANSIENT_RETRIES = 2;
-const BASE_RETRY_DELAY_MS = 1000;
-const RETRYABLE_STATUSES = new Set([429, 502, 503, 504]);
-
-function parseRetryAfterMs(header: string | null): number | null {
-  if (!header) return null;
-  const seconds = Number(header);
-  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
-  const dateMs = Date.parse(header);
-  if (!Number.isNaN(dateMs)) return Math.max(0, dateMs - Date.now());
-  return null;
-}
-
-function sleep(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal.aborted) {
-      reject(signal.reason);
-      return;
-    }
-    const timer = setTimeout(() => {
-      signal.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      clearTimeout(timer);
-      reject(signal.reason);
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-  });
-}
 
 export interface ProxyOptions {
   /**
@@ -127,10 +65,7 @@ export async function proxyToTokenHub(
     url.searchParams.delete(PROXY_API_KEY_QUERY_PARAM);
   }
 
-  const headers = new Headers();
-  req.headers.forEach((value, key) => {
-    if (!STRIP_REQUEST_HEADERS.has(key.toLowerCase())) headers.set(key, value);
-  });
+  const headers = forwardableRequestHeaders(req);
   if (opts.auth === "anthropic") {
     headers.set("x-api-key", apiKey);
   } else {
@@ -144,64 +79,36 @@ export async function proxyToTokenHub(
   const hasBody = req.method !== "GET" && req.method !== "HEAD";
   const body = hasBody ? await req.arrayBuffer() : undefined;
 
-  let upstream: Response | undefined;
-  let retries = 0;
-  while (true) {
-    let networkError: unknown;
-    try {
-      upstream = await fetch(url, {
-        method: req.method,
-        headers,
-        body,
-        redirect: "manual",
-        cache: "no-store",
-        signal: req.signal,
-      });
-    } catch (err) {
-      networkError = err;
-    }
-
-    const retryableStatus = upstream !== undefined && RETRYABLE_STATUSES.has(upstream.status);
-    if ((networkError === undefined && !retryableStatus) || retries >= MAX_TRANSIENT_RETRIES) {
-      if (networkError !== undefined) {
-        const cause = networkError instanceof Error && networkError.cause ? ` (${String(networkError.cause)})` : "";
-        const message = networkError instanceof Error ? networkError.message : String(networkError);
-        const errorHeaders = new Headers();
-        if (retries > 0) errorHeaders.set("x-tokenhub-proxy-retries", String(retries));
-        return Response.json(
-          {
-            error: {
-              message: `Upstream TokenHub request failed: ${message}${cause}`,
-              type: "proxy_upstream_error",
-              code: "upstream_unreachable",
-            },
-          },
-          { status: 502, headers: errorHeaders },
-        );
-      }
-      break;
-    }
-
-    // Either a thrown network error or a retryable status with budget left.
-    const retryAfterMs = upstream ? parseRetryAfterMs(upstream.headers.get("retry-after")) : null;
-    const delayMs = retryAfterMs ?? BASE_RETRY_DELAY_MS * 2 ** retries;
-    retries++;
-    await sleep(delayMs, req.signal);
+  let upstream: Response;
+  let retries: number;
+  try {
+    ({ response: upstream, retries } = await fetchWithTransientRetry(
+      url,
+      { method: req.method, headers, body, redirect: "manual", cache: "no-store" },
+      req.signal,
+    ));
+  } catch (err) {
+    if (!(err instanceof UpstreamUnreachableError)) throw err;
+    const errorHeaders = new Headers();
+    if (err.retries > 0) errorHeaders.set("x-tokenhub-proxy-retries", String(err.retries));
+    return Response.json(
+      {
+        error: {
+          message: `Upstream TokenHub request failed: ${err.message}`,
+          type: "proxy_upstream_error",
+          code: "upstream_unreachable",
+        },
+      },
+      { status: 502, headers: errorHeaders },
+    );
   }
-  // Every loop exit other than `break` already `return`s, and `break` is only
-  // reached once a fetch has actually resolved (networkError === undefined),
-  // so `upstream` is always assigned here.
-  const resolvedUpstream = upstream!;
 
-  const responseHeaders = new Headers();
-  resolvedUpstream.headers.forEach((value, key) => {
-    if (!STRIP_RESPONSE_HEADERS.has(key.toLowerCase())) responseHeaders.set(key, value);
-  });
+  const responseHeaders = forwardableResponseHeaders(upstream);
   if (retries > 0) responseHeaders.set("x-tokenhub-proxy-retries", String(retries));
 
-  return new Response(resolvedUpstream.body, {
-    status: resolvedUpstream.status,
-    statusText: resolvedUpstream.statusText,
+  return new Response(upstream.body, {
+    status: upstream.status,
+    statusText: upstream.statusText,
     headers: responseHeaders,
   });
 }

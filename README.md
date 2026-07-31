@@ -1,6 +1,11 @@
 # tokenhub-proxy
 
-A Next.js API proxy for [Tencent Cloud TokenHub](https://www.tencentcloud.com/document/product/1300/78941) (LLM Service gateway) with **1:1 endpoint mappings**. Your TokenHub API key stays server-side; clients call this proxy with the exact same paths, bodies, and streaming semantics as TokenHub itself.
+A Next.js API proxy hosting two independent upstreams:
+
+- **`/v1/*` and `/plan/*`** — [Tencent Cloud TokenHub](https://www.tencentcloud.com/document/product/1300/78941) (LLM Service gateway), with **1:1 endpoint mappings**.
+- **`/kimi/*`** — [Moonshot AI](https://platform.moonshot.ai) serving `kimi-k3` through an **Anthropic-compatible** API, so Claude Code and the Anthropic SDKs can point straight at it. See [Kimi surface](#kimi-surface-kimi) below.
+
+Each surface has its own upstream credential and its own client-facing shared secret; both stay server-side. Clients call this proxy with the same paths, bodies, and streaming semantics as the upstream itself.
 
 ## Endpoints (1:1 with TokenHub)
 
@@ -21,32 +26,130 @@ A Next.js API proxy for [Tencent Cloud TokenHub](https://www.tencentcloud.com/do
 
 Endpoints that do **not** exist upstream (verified by live probe) and are therefore not mapped: `/v1/files`, `/v1/completions`, `/v1/rerank`, `/v1/messages/count_tokens`.
 
+## Kimi surface (`/kimi/*`)
+
+A second, independent proxy in the same deployment, fronting Moonshot AI's
+`kimi-k3` with an Anthropic-compatible API.
+
+| Method | Path | Protocol | Notes |
+|--------|------|----------|-------|
+| POST | `/kimi/v1/messages` | Anthropic-compatible | Forwarded to Moonshot's native Anthropic endpoint; SSE via `stream: true` |
+| POST | `/kimi/v1/messages/count_tokens` | Anthropic-compatible | Synthesized locally (see below) |
+| GET | `/kimi/v1/models` | Anthropic-compatible | Synthesized locally (see below) |
+| POST | `/kimi/v1/chat/completions` | OpenAI-compatible | Raw OpenAI surface for clients that prefer it |
+
+### Pointing a client at it
+
+Moonshot serves a **native** Anthropic Messages API, so no protocol translation
+happens here — the request is forwarded and the upstream's own Anthropic
+response and SSE event stream are streamed back. Claude Code:
+
+```bash
+export ANTHROPIC_BASE_URL=https://your-deployment.vercel.app/kimi
+export ANTHROPIC_AUTH_TOKEN=<KIMI_PROXY_API_KEY>
+claude
+```
+
+Anthropic SDK (base URL **without** `/v1` — the SDK appends `/v1/messages`):
+
+```ts
+import Anthropic from "@anthropic-ai/sdk";
+const client = new Anthropic({
+  baseURL: "http://localhost:3000/kimi",
+  apiKey: process.env.KIMI_PROXY_API_KEY,
+});
+```
+
+### Configuration
+
+```
+KIMI_API_KEY=sk-...                      # required — Moonshot key, never leaves the server
+KIMI_BASE_URL=https://api.moonshot.ai    # optional (default); China mainland: https://api.moonshot.cn
+KIMI_MODEL=kimi-k3                       # optional (default)
+KIMI_PROXY_API_KEY=...                   # required — shared secret for /kimi/*
+```
+
+`KIMI_PROXY_API_KEY` is deliberately separate from `PROXY_API_KEY`: a client
+holding one cannot reach the other surface, and either can be rotated alone.
+Both are accepted as `Authorization: Bearer <key>`, `x-api-key: <key>`, or
+`?api_key=<key>`.
+
+### Behavior
+
+- **Model coercion.** The upstream accepts *any* model string and echoes it
+  back rather than rejecting it, so an un-coerced `claude-sonnet-4-5` request
+  would silently run on something other than the advertised model. Every
+  request whose `model` does not already start with `kimi-` is therefore
+  rewritten to `KIMI_MODEL`. This is what lets Claude Code's hardcoded
+  `claude-*` model ids work unchanged. A caller who genuinely wants a different
+  Kimi model can ask for it by name (e.g. `kimi-k2.6`).
+- **`count_tokens` is synthesized.** The upstream Anthropic surface has no
+  `count_tokens` path (it 404s), so the proxy computes the count with
+  Moonshot's own tokenizer endpoint. Anthropic content blocks are flattened to
+  their text for counting, and tool definitions are included; image blocks
+  contribute no countable text and are therefore under-counted.
+- **`models` is synthesized.** The upstream Anthropic surface has no `models`
+  path either, so the OpenAI-shaped model list is re-enveloped into Anthropic's
+  `{data:[{type:"model",...}],has_more,first_id,last_id}` form.
+- **Errors are normalized.** Upstream failures are not Anthropic-shaped (its
+  gateway emits `{code,error,message,scode,...}`), which an Anthropic SDK
+  cannot turn into a meaningful exception; anything that is not already a
+  `{type:"error"}` envelope is rewritten into one, with the error type derived
+  from the HTTP status.
+- **Client headers are not forwarded.** `anthropic-beta` feature flags and
+  `x-stainless-*` SDK telemetry are not implemented upstream, so forwarding
+  them risks a rejection for no benefit. Prompt caching upstream is automatic
+  and needs no opt-in header. `anthropic-version` is not required.
+- **Retries** reuse the same transient-failure policy as the TokenHub surface
+  (`429`/`502`/`503`/`504` and network-level failures, twice, with backoff);
+  a retried response carries `X-Kimi-Proxy-Retries: <n>`.
+
+### Things to know about `kimi-k3`
+
+- It reports `supports_thinking_type: "only"`, so **every** response spends
+  output budget on a `thinking` block before any `text` block. A small
+  `max_tokens` returns a response containing thinking and no text at all —
+  budget accordingly (the console commands default to 400 for this reason).
+- Context window is 1,048,576 tokens; it supports tool calling, image input and
+  video input. Anthropic `image` blocks (both `base64` and `url` sources) work
+  unchanged.
+- The upstream accepts the content block types `text`, `image`, `thinking` and
+  `server_tool_use`. A `document` block is rejected with an
+  `invalid_request_error` naming those tags, rather than being silently
+  dropped.
+- Tool-use ids come back in the form `get_weather_0` rather than Anthropic's
+  `toolu_` prefix. Clients that merely echo the id back in `tool_result` are
+  unaffected.
+- On a cache hit the upstream reports `input_tokens: 0` with the real figure in
+  `cache_read_input_tokens`. A client costing on `input_tokens` alone will
+  under-report; the full `usage` object is passed through untouched.
+
 ## Interactive console
 
 `GET /` serves an xterm.js-based terminal console for exercising every endpoint above without leaving the browser — a REPL with a command per endpoint, each pre-filled with a working example body you can run as-is or override.
 
 ```
-tokenhub ❯ auth set
-Proxy API key (hidden): ••••••••••••••••••
-Proxy key set (ending "…yday"). Stored in this browser only.
+tokenhub > auth set
+Proxy API key (hidden): ********************
+Proxy key set (ending "...yday"). Stored in this browser only.
 
-tokenhub ❯ chat "Say hello"
+tokenhub > chat "Say hello"
 POST /v1/chat/completions
-✓ 200 OK
+OK 200 OK
 {
-  "id": "…",
+  "id": "...",
   "choices": [ { "message": { "content": "Hello!" } } ],
-  …
+  ...
 }
 
-tokenhub ❯ chat.stream "Count to 3"
+tokenhub > chat.stream "Count to 3"
 POST /v1/chat/completions (stream)
-✓ 200 streaming…
+OK 200 streaming...
 1, 2, 3
 ```
 
 - **Auth**: `auth set` prompts for `PROXY_API_KEY` without echoing it to the screen or recording it in command history; `auth <key>` sets it inline (faster, but visible in the terminal transcript, same tradeoff as passing a secret as a CLI argument anywhere); `auth clear` / bare `auth` clear or check status. The key is stored in `localStorage`, scoped to your browser, and never sent anywhere except as this same proxy's own `Authorization` header — it is not logged or persisted server-side.
-- **Commands**: one per endpoint (`chat`, `chat.stream`, `messages`, `messages.stream`, `embeddings`, `embeddings.multimodal`, `translate`, `models`, `batches.list`, `batches.create`, `batches.get`, `plan.messages`), plus `endpoints`, `help`, `clear`, and `copy`. Every command accepts `--raw '<json>'` to fully replace its preset body. Run `help` for the full list, `help <command>` for usage.
+- **Commands**: one per TokenHub endpoint (`chat`, `chat.stream`, `messages`, `messages.stream`, `embeddings`, `embeddings.multimodal`, `translate`, `models`, `batches.list`, `batches.create`, `batches.get`, `plan.messages`), one per Kimi endpoint (`kimi`, `kimi.stream`, `kimi.count`, `kimi.models`, `kimi.chat` — each accepts `--key K` to use `KIMI_PROXY_API_KEY` instead of whatever `auth` currently holds), plus `endpoints`, `help`, `clear`, and `copy`. Every command accepts `--raw '<json>'` to fully replace its preset body. Run `help` for the full list, `help <command>` for usage.
 - **Syntax highlighting**: JSON responses are colorized (keys/strings/numbers/booleans distinguished; long primitive arrays — e.g. embedding vectors — are truncated with a count so a 1024-float response doesn't flood the screen); the input line is colorized live as you type (command name, quoted strings, `--flags`).
 - **Copy/paste**: drag-select text and press Ctrl/Cmd+C to copy it to the OS clipboard (does not also trigger cancel — that only fires on Ctrl+C with no active selection); the `copy` command copies the last response body directly. Ctrl/Cmd+V pastes from the OS clipboard into the input line, same as any native terminal.
 - Every response is escaped before being written to the terminal (JSON string leaves via `JSON.stringify`'s own escaping, raw streamed text via an explicit sanitizer) so a model response containing a raw control byte can't be interpreted as a live terminal escape sequence.
@@ -147,7 +250,7 @@ LLMs: `hy3`, `deepseek-v4-flash`, `deepseek-v4-pro`, `deepseek-v4-flash-202605`,
 
 Reaching the 1800s value used here requires:
 - **Pro or Enterprise** — Hobby cannot exceed 300s regardless of any config in this repo.
-- The project's **Node.js Version** set to `20.x`, `22.x`, or `24.x` in Vercel's dashboard (**Project Settings → Functions**) — this is the only currently-supported runtime range for the extended-duration beta and isn't something a config file can set for you.
+- The project's **Node.js Version** set to `20.x`, `22.x`, or `24.x` in Vercel's dashboard (**Project Settings -> Functions**) — this is the only currently-supported runtime range for the extended-duration beta and isn't something a config file can set for you.
 - Not using Secure Compute or Static IPs, which don't support durations above 800s during the beta.
 
 For workloads that genuinely need more than 30 minutes, Vercel's own guidance is to use [Vercel Workflows](https://vercel.com/docs/workflows) instead of a single long-running function.

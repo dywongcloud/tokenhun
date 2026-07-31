@@ -28,6 +28,7 @@ export interface Command {
 }
 
 const DEFAULT_MODEL = "deepseek-v4-flash";
+const DEFAULT_KIMI_MODEL = "kimi-k3";
 
 function textArg(args: ParsedArgs, fallback: string): string {
   return args.positional.join(" ") || fallback;
@@ -45,7 +46,7 @@ function buildBody(args: ParsedArgs, preset: Record<string, unknown>): unknown {
 }
 
 function maskKey(key: string): string {
-  return key.length <= 4 ? "*".repeat(key.length) : `…${key.slice(-4)}`;
+  return key.length <= 4 ? "*".repeat(key.length) : `...${key.slice(-4)}`;
 }
 
 function requireAuth(ctx: CommandContext): boolean {
@@ -54,12 +55,23 @@ function requireAuth(ctx: CommandContext): boolean {
   return false;
 }
 
-async function callProxy(ctx: CommandContext, path: string, init: RequestInit = {}): Promise<Response> {
-  const key = ctx.getProxyKey();
+async function callProxy(
+  ctx: CommandContext,
+  path: string,
+  init: RequestInit = {},
+  keyOverride?: string,
+): Promise<Response> {
+  const key = keyOverride ?? ctx.getProxyKey();
   const headers = new Headers(init.headers);
   headers.set("Content-Type", "application/json");
   if (key) headers.set("Authorization", `Bearer ${key}`);
   return fetch(path, { ...init, headers, signal: ctx.signal });
+}
+
+// The /kimi routes are gated by their own shared secret, which need not equal
+// the one `auth` stores; --key supplies it per call when the two differ.
+function keyOverride(args: ParsedArgs): string | undefined {
+  return typeof args.flags.key === "string" ? args.flags.key : undefined;
 }
 
 async function printJsonResponse(ctx: CommandContext, res: Response): Promise<void> {
@@ -73,7 +85,7 @@ async function printJsonResponse(ctx: CommandContext, res: Response): Promise<vo
   const pretty = typeof parsed === "string" ? parsed : JSON.stringify(parsed, null, 2);
   ctx.setLastResponse(pretty);
   ctx.writeln(
-    res.ok ? colors.success(`✓ ${res.status} ${res.statusText}`) : colors.error(`✗ ${res.status} ${res.statusText}`),
+    res.ok ? colors.success(`OK ${res.status} ${res.statusText}`) : colors.error(`FAIL ${res.status} ${res.statusText}`),
   );
   ctx.writeln(typeof parsed === "string" ? sanitizeRawText(parsed) : highlightJson(parsed));
 }
@@ -151,7 +163,7 @@ export const commands: Command[] = [
         await printJsonResponse(ctx, res);
         return;
       }
-      ctx.writeln(colors.success(`✓ ${res.status} streaming…`));
+      ctx.writeln(colors.success(`OK ${res.status} streaming...`));
       let full = "";
       await readSseLines(
         res,
@@ -216,7 +228,7 @@ export const commands: Command[] = [
         await printJsonResponse(ctx, res);
         return;
       }
-      ctx.writeln(colors.success(`✓ ${res.status} streaming…`));
+      ctx.writeln(colors.success(`OK ${res.status} streaming...`));
       let full = "";
       let currentEvent = "";
       await readSseLines(
@@ -324,11 +336,11 @@ export const commands: Command[] = [
   },
   {
     name: "batches.create",
-    summary: "Create a batch job (⚠ request schema is not publicly documented)",
+    summary: "Create a batch job (! request schema is not publicly documented)",
     usage: "batches.create [--raw '{...}']",
     async run(args, ctx) {
       if (!requireAuth(ctx)) return;
-      ctx.writeln(colors.error("⚠ TokenHub does not publicly document this endpoint's request schema."));
+      ctx.writeln(colors.error("! TokenHub does not publicly document this endpoint's request schema."));
       ctx.writeln(colors.muted("Sending a best-effort guess modeled on the OpenAI Batch API shape — it may fail."));
       const preset = { endpoint: "/v1/chat/completions", completion_window: "24h", input_file_id: "REPLACE_ME" };
       ctx.writeln(colors.muted("POST /v1/batches"));
@@ -375,8 +387,137 @@ export const commands: Command[] = [
     },
   },
   {
+    name: "kimi",
+    summary: "Kimi Messages — Anthropic-compatible, non-streaming",
+    usage: 'kimi ["message"] [--model NAME] [--max-tokens N] [--key K] [--raw \'{...}\']',
+    async run(args, ctx) {
+      if (!requireAuth(ctx)) return;
+      const preset = {
+        model: (args.flags.model as string) || DEFAULT_KIMI_MODEL,
+        // kimi-k3 always emits a thinking block first, so a small budget
+        // returns thinking with no text at all.
+        max_tokens: Number(args.flags["max-tokens"] ?? 400),
+        messages: [{ role: "user", content: textArg(args, "Say hello in one short sentence.") }],
+      };
+      ctx.writeln(colors.muted("POST /kimi/v1/messages"));
+      const res = await callProxy(
+        ctx,
+        "/kimi/v1/messages",
+        { method: "POST", body: JSON.stringify(buildBody(args, preset)) },
+        keyOverride(args),
+      );
+      await printJsonResponse(ctx, res);
+    },
+  },
+  {
+    name: "kimi.stream",
+    summary: "Kimi Messages — Anthropic-compatible, streamed (thinking shown dimmed)",
+    usage: 'kimi.stream ["message"] [--model NAME] [--max-tokens N] [--key K]',
+    async run(args, ctx) {
+      if (!requireAuth(ctx)) return;
+      const preset = {
+        model: (args.flags.model as string) || DEFAULT_KIMI_MODEL,
+        max_tokens: Number(args.flags["max-tokens"] ?? 400),
+        stream: true,
+        messages: [{ role: "user", content: textArg(args, "Count from 1 to 5.") }],
+      };
+      ctx.writeln(colors.muted("POST /kimi/v1/messages (stream)"));
+      const res = await callProxy(
+        ctx,
+        "/kimi/v1/messages",
+        { method: "POST", body: JSON.stringify(buildBody(args, preset)) },
+        keyOverride(args),
+      );
+      if (!res.ok) {
+        await printJsonResponse(ctx, res);
+        return;
+      }
+      ctx.writeln(colors.success(`OK ${res.status} streaming...`));
+      let full = "";
+      let currentEvent = "";
+      await readSseLines(
+        res,
+        (line) => {
+          if (line.startsWith("event: ")) {
+            currentEvent = line.slice(7);
+            return;
+          }
+          if (!line.startsWith("data: ")) return;
+          try {
+            const payload = JSON.parse(line.slice(6));
+            if (currentEvent !== "content_block_delta") return;
+            if (payload?.delta?.type === "text_delta") {
+              const text = String(payload.delta.text ?? "");
+              full += text;
+              ctx.write(sanitizeRawText(text));
+            } else if (payload?.delta?.type === "thinking_delta") {
+              ctx.write(colors.muted(sanitizeRawText(String(payload.delta.thinking ?? ""))));
+            }
+          } catch {
+            // Ignore non-JSON lines (e.g. ping events with no data payload).
+          }
+        },
+        ctx.signal,
+      );
+      ctx.write("\n");
+      ctx.setLastResponse(full);
+    },
+  },
+  {
+    name: "kimi.count",
+    summary: "Count input tokens for a Kimi Messages request",
+    usage: 'kimi.count ["message"] [--model NAME] [--key K] [--raw \'{...}\']',
+    async run(args, ctx) {
+      if (!requireAuth(ctx)) return;
+      const preset = {
+        model: (args.flags.model as string) || DEFAULT_KIMI_MODEL,
+        messages: [{ role: "user", content: textArg(args, "hello world") }],
+      };
+      ctx.writeln(colors.muted("POST /kimi/v1/messages/count_tokens"));
+      const res = await callProxy(
+        ctx,
+        "/kimi/v1/messages/count_tokens",
+        { method: "POST", body: JSON.stringify(buildBody(args, preset)) },
+        keyOverride(args),
+      );
+      await printJsonResponse(ctx, res);
+    },
+  },
+  {
+    name: "kimi.models",
+    summary: "List Kimi models (Anthropic list shape)",
+    usage: "kimi.models [--key K]",
+    async run(args, ctx) {
+      if (!requireAuth(ctx)) return;
+      ctx.writeln(colors.muted("GET /kimi/v1/models"));
+      const res = await callProxy(ctx, "/kimi/v1/models", { method: "GET" }, keyOverride(args));
+      await printJsonResponse(ctx, res);
+    },
+  },
+  {
+    name: "kimi.chat",
+    summary: "Kimi chat completion — OpenAI-compatible, non-streaming",
+    usage: 'kimi.chat ["message"] [--model NAME] [--max-tokens N] [--key K] [--raw \'{...}\']',
+    async run(args, ctx) {
+      if (!requireAuth(ctx)) return;
+      const preset = {
+        model: (args.flags.model as string) || DEFAULT_KIMI_MODEL,
+        messages: [{ role: "user", content: textArg(args, "Say hello in one short sentence.") }],
+        max_tokens: Number(args.flags["max-tokens"] ?? 400),
+      };
+      ctx.writeln(colors.muted("POST /kimi/v1/chat/completions"));
+      const res = await callProxy(
+        ctx,
+        "/kimi/v1/chat/completions",
+        { method: "POST", body: JSON.stringify(buildBody(args, preset)) },
+        keyOverride(args),
+      );
+      await printJsonResponse(ctx, res);
+    },
+  },
+  {
     name: "endpoints",
-    summary: "List every mapped TokenHub endpoint (no auth required)",
+    summary: "List every mapped endpoint (no auth required)",
     usage: "endpoints",
     async run(_args, ctx) {
       const res = await fetch("/api/endpoints");
@@ -474,9 +615,9 @@ export const commands: Command[] = [
       ctx.writeln("");
       ctx.writeln(colors.muted("Every command accepts --raw '<json>' to fully override the preset body."));
       ctx.writeln(
-        colors.muted("Keys: ↑/↓ history · Tab complete · Ctrl+C cancel/abort · Ctrl+C on a selection copies it"),
+        colors.muted("Keys: Up/Down history - Tab complete - Ctrl+C cancel/abort - Ctrl+C on a selection copies it"),
       );
-      ctx.writeln(colors.muted("      Ctrl+V / ⌘V pastes · drag-select then Ctrl/⌘+C copies to the OS clipboard"));
+      ctx.writeln(colors.muted("      Ctrl+V / Cmd+V pastes - drag-select then Ctrl/Cmd+C copies to the OS clipboard"));
     },
   },
 ];
